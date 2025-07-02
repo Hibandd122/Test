@@ -3,6 +3,7 @@ import base64
 import string
 from PIL import Image
 from flask import Flask, request, jsonify
+from flask_cors import CORS  # ✅ Thêm dòng này
 
 import torch
 import torch.nn as nn
@@ -49,6 +50,7 @@ transform = transforms.Compose([
 
 # ==== Flask App ====
 app = Flask(__name__)
+CORS(app)  # ✅ Kích hoạt CORS
 
 @app.route("/", methods=["POST"])
 def predict_base64():
