@@ -1,0 +1,140 @@
+import os
+import csv
+import string
+from PIL import Image
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torchvision.models as models
+import torchvision.transforms as transforms
+from torch.utils.data import Dataset, DataLoader
+
+# ==== Cấu hình chung ====
+CHAR_SET = string.digits + string.ascii_uppercase
+CHAR2IDX = {c: i for i, c in enumerate(CHAR_SET)}
+IDX2CHAR = {i: c for c, i in CHAR2IDX.items()}
+IMG_HEIGHT = 50
+IMG_WIDTH = 180
+SEQ_LEN = 4
+NUM_CLASSES = len(CHAR_SET)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ==== Encode / Decode ====
+def encode_label(label):
+    return [CHAR2IDX[c] for c in label]
+
+def decode_label(indices):
+    return ''.join(IDX2CHAR[i] for i in indices)
+
+# ==== Dataset ====
+class CaptchaDataset(Dataset):
+    def __init__(self, folder):
+        self.folder = folder
+        self.files = []
+        for f in os.listdir(folder):
+            if f.endswith(".png") and len(os.path.splitext(f)[0]) == SEQ_LEN:
+                self.files.append(f)
+        print(f"✅ Tổng số ảnh hợp lệ: {len(self.files)}")
+        self.transform = transforms.Compose([
+            transforms.Grayscale(),
+            transforms.Resize((IMG_HEIGHT, IMG_WIDTH)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,))
+        ])
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        filename = self.files[idx]
+        label_str = os.path.splitext(filename)[0]
+        label = torch.tensor(encode_label(label_str), dtype=torch.long)
+        img_path = os.path.join(self.folder, filename)
+
+        try:
+            image = Image.open(img_path).convert("L")
+            return self.transform(image), label, filename
+        except Exception as e:
+            print(f"❌ Lỗi khi mở ảnh {filename}: {e}")
+            return self.__getitem__((idx + 1) % len(self.files))  # thử lại ảnh kế tiếp
+
+# ==== Model ====
+class CaptchaResNetLSTM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        base = models.resnet18(pretrained=False)
+        base.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.backbone = nn.Sequential(
+            base.conv1,
+            base.bn1,
+            base.relu,
+            base.maxpool,
+            base.layer1,
+            base.layer2,
+            base.layer3,
+            base.layer4,
+        )
+        self.rnn = nn.LSTM(input_size=512, hidden_size=256, num_layers=2,
+                           batch_first=True, bidirectional=True)
+        self.fc = nn.Linear(512, SEQ_LEN * NUM_CLASSES)
+
+    def forward(self, x):
+        features = self.backbone(x)
+        b, c, h, w = features.size()
+        x = features.permute(0, 2, 3, 1).reshape(b, -1, c)  # [B, seq_len, features]
+        rnn_out, _ = self.rnn(x)
+        rnn_feat = rnn_out.mean(dim=1)
+        out = self.fc(rnn_feat)
+        return out.view(-1, SEQ_LEN, NUM_CLASSES)
+
+def test_all():
+    folder = r"D:\code\viotp\modle\captcha_images_v2"
+    model_path = "resnet_lstm_best.pth"
+
+    dataset = CaptchaDataset(folder)
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
+
+    model = CaptchaResNetLSTM().to(DEVICE)
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    model.eval()
+
+    results = []
+    correct_count = 0
+    total_count = 0
+
+    with torch.no_grad():
+        for images, labels, filenames in tqdm(loader, desc="🔍 Testing"):
+            images = images.to(DEVICE)
+            logits = model(images)
+
+            pred_indices = logits.argmax(dim=2).squeeze(0).tolist()
+            pred_str = decode_label(pred_indices)
+            true_str = decode_label(labels.squeeze(0).tolist())
+
+            probs = torch.softmax(logits, dim=2)
+            avg_conf = probs.max(dim=2).values.mean().item()
+            correct = pred_str == true_str
+            status = "✅" if correct else "❌"
+
+            if correct:
+                correct_count += 1
+            total_count += 1
+
+            results.append([filenames[0], true_str, pred_str, f"{avg_conf:.4f}", status])
+
+    # ==== Lưu CSV ====
+    with open("test_results.csv", "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Tên ảnh", "Ground Truth", "Dự đoán", "Xác suất TB", "Kết quả"])
+        writer.writerows(results)
+
+    # ==== In thống kê ====
+    print(f"\n📄 Đã lưu kết quả vào: test_results.csv")
+    print(f"✅ Đúng: {correct_count} ảnh")
+    print(f"❌ Sai: {total_count - correct_count} ảnh")
+    print(f"🎯 Tỷ lệ chính xác: {(correct_count / total_count) * 100:.2f}%")
+
+# ==== Run ====
+if __name__ == "__main__":
+    test_all()
